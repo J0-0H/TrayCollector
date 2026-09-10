@@ -948,10 +948,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
         return 0;
 
-    case WM_DISPLAYCHANGE:
+    case WM_DISPLAYCHANGE: // 完全可以删除这一行，或者让它直接 return DefWindowProc
+        return 0;
+
     case WM_POWERBROADCAST:
-        // [新增] 发生显示器变化或电源状态恢复时，重新添加自身主图标并唤醒DLL
-        if (msg == WM_DISPLAYCHANGE || (msg == WM_POWERBROADCAST && (w == PBT_APMPOWERSTATUSCHANGE || w == PBT_APMRESUMEAUTOMATIC))) {
+        // 仅在发生实质性的电源状态切换或唤醒时，再触发图标重建逻辑
+        if (w == PBT_APMPOWERSTATUSCHANGE || w == PBT_APMRESUMEAUTOMATIC) {
             Shell_NotifyIconW(NIM_ADD, &g_selfNid);
 
             HANDLE hFilter = CreateFileW(GetExeDirFile(L"Filter.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
