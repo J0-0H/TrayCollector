@@ -1,0 +1,30 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+	<!-- 添加应用标识 (最佳实践) -->
+	<assemblyIdentity version="1.0.0.0" name="TrayCollector.Controller.App"/>
+
+	<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+		<security>
+			<requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+				<!-- 核心修改：请求管理员权限 (你已经有了，我保留并标准化了它) -->
+				<requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+			</requestedPrivileges>
+		</security>
+	</trustInfo>
+
+	<compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+		<application>
+			<!-- Windows 10 / 11 兼容性声明 -->
+			<supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+		</application>
+	</compatibility>
+
+	<!-- 核心增强：全面启用 DPI 感知 (Per Monitor V2) -->
+	<!-- 对于托盘图标收集器这种涉及图像显示的工具，这能彻底避免图标在 4K 屏上变糊 -->
+	<asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+		<asmv3:windowsSettings xmlns="urn:schemas-microsoft-com:asm.v3">
+			<dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+			<dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+		</asmv3:windowsSettings>
+	</asmv3:application>
+</assembly>
