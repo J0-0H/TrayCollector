@@ -68,7 +68,8 @@ static void ForceRefreshTrayIcons() {
 
 static DWORD WINAPI RetryForceRefreshThreadImpl() {
     g_pendingRetryThreads.fetch_add(1);
-    static const int delaysMs[] = { 100, 200, 400, 800, 1500, 3000 };
+    // [修改] 移除冗长的高频刷新
+    static const int delaysMs[] = { 150, 400 };
     for (int d : delaysMs) {
         Sleep(d);
         if (g_stop || g_unloading.load()) break;
