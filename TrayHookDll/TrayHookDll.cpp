@@ -13,6 +13,11 @@
 #include "../Common/Protocol.h" 
 
 static HANDLE g_hPipe = INVALID_HANDLE_VALUE;
+// [新增] 管道重连冷却：连接失败后短时间内不再反复重试，
+// 避免 Controller.exe 掉线/重启期间，每一次 Shell_NotifyIcon 调用
+// 都要卡住调用方线程（往往就是目标程序自己的 UI 线程）最多 2 秒。
+static DWORD g_lastPipeFailTick = 0;
+static constexpr DWORD kPipeRetryCooldownMs = 800;
 static CRITICAL_SECTION g_cs;
 static std::atomic_bool g_csReady(false), g_shouldIntercept(false), g_stop(false), g_hooksReady(false);
 static WCHAR g_exePath[MAX_PATH]{};
@@ -21,30 +26,24 @@ static HANDLE g_hStopEvent = nullptr;
 static HANDLE g_hMonitorThread = nullptr;
 
 static std::atomic_bool g_unloading(false);
-static std::atomic_int  g_pendingRetryThreads(0);
 static std::atomic_int  g_inFlightHooks(0);
 
 static HANDLE g_hRestoreAllEvent = nullptr;
 static HANDLE g_hFilterChangedEvent = nullptr;
+static HANDLE g_hTrayRebuildEvent = nullptr;
 
 static UINT g_msgTaskbarCreated = 0;
 
 static void BeginSelfUnload();
 
-// [修复2] 用于枚举深层子窗口的的回调
-static BOOL CALLBACK EnumChildProc(HWND hwnd, LPARAM) {
-    // 采用与 Explorer 相同的 SendNotifyMessageW 下发广播，确保子窗口能响应
-    SendNotifyMessageW(hwnd, g_msgTaskbarCreated, 0, 0);
-    return TRUE;
-}
-
 static BOOL CALLBACK EnumTargetWindowsProc(HWND hwnd, LPARAM) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == GetCurrentProcessId()) {
-        SendNotifyMessageW(hwnd, g_msgTaskbarCreated, 0, 0);
-        // 对部分将图标维护逻辑写在子窗口的老式 32 位应用做纵深打击
-        EnumChildWindows(hwnd, EnumChildProc, 0);
+        // 只通知当前进程自己的顶层窗口。
+        // 不再递归枚举子窗口，避免一次刷新让同一应用收到大量重复的
+        // TaskbarCreated，从而触发连续的 NIM_ADD/NIM_MODIFY。
+        PostMessageW(hwnd, g_msgTaskbarCreated, 0, 0);
     }
     return TRUE;
 }
@@ -55,44 +54,25 @@ static void ForceRefreshTrayIcons() {
     }
     EnumWindows(EnumTargetWindowsProc, 0);
 
+    // 一些程序使用 message-only window 维护托盘图标。
+    // 仍然保留这一层，但不再向它们的子窗口继续递归广播。
     HWND hMsgWnd = nullptr;
     while ((hMsgWnd = FindWindowExW(HWND_MESSAGE, hMsgWnd, nullptr, nullptr)) != nullptr) {
         DWORD pid = 0;
         GetWindowThreadProcessId(hMsgWnd, &pid);
         if (pid == GetCurrentProcessId()) {
-            SendNotifyMessageW(hMsgWnd, g_msgTaskbarCreated, 0, 0);
-            EnumChildWindows(hMsgWnd, EnumChildProc, 0);
+            PostMessageW(hMsgWnd, g_msgTaskbarCreated, 0, 0);
         }
     }
 }
 
-static DWORD WINAPI RetryForceRefreshThreadImpl() {
-    g_pendingRetryThreads.fetch_add(1);
-    // [修改] 移除冗长的高频刷新
-    static const int delaysMs[] = { 150, 400 };
-    for (int d : delaysMs) {
-        Sleep(d);
-        if (g_stop || g_unloading.load()) break;
-        if (!g_shouldIntercept.load()) break;
-        ForceRefreshTrayIcons();
+static void InitialRefresh() {
+    if (!g_stop.load() && !g_unloading.load() && g_shouldIntercept.load()) {
+        Sleep(100);
+        if (!g_stop.load() && !g_unloading.load() && g_shouldIntercept.load()) {
+            ForceRefreshTrayIcons();
+        }
     }
-    g_pendingRetryThreads.fetch_sub(1);
-    return 0;
-}
-
-static DWORD WINAPI RetryForceRefreshThread(LPVOID) {
-    __try {
-        return RetryForceRefreshThreadImpl();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_pendingRetryThreads.fetch_sub(1);
-        return 0;
-    }
-}
-
-static void ScheduleRefreshRetries() {
-    if (g_unloading.load() || g_stop.load()) return;
-    CreateThread(nullptr, 0, RetryForceRefreshThread, nullptr, 0, nullptr);
 }
 
 using Shell_NotifyIconW_t = BOOL(WINAPI*)(DWORD, PNOTIFYICONDATAW);
@@ -108,6 +88,14 @@ struct IconState {
 
 static std::mutex g_stateMutex;
 static std::map<std::wstring, IconState> g_states;
+
+// [新增] 判断某个图标 key 是否已经在本地状态表里出现过。
+// 用于识别"这是本次 Hook 生效之后第一次看到这个图标"——
+// 详见 DetourWImpl/DetourAImpl 里的用法说明。
+static bool HasKnownState(const std::wstring& key) {
+    std::lock_guard<std::mutex> l(g_stateMutex);
+    return g_states.find(key) != g_states.end();
+}
 
 static void Log(const std::wstring& s) {
     OutputDebugStringW((L"[TrayHookDll] " + s + L"\r\n").c_str());
@@ -298,21 +286,34 @@ static bool EnsurePipe() {
         return true;
     }
 
-    for (int i = 0; i < 10; i++) {
+    // [新增] 冷却期内直接判定失败，不再走完整的重连循环。
+    // Controller.exe 不在（还没启动/正在重启/崩溃）时，管道永远连不上，
+    // 如果每次 Shell_NotifyIcon 调用都要跑完下面最长 ~2 秒的重试，
+    // 目标程序自己的 UI 线程会被反复卡住，表现为"卡顿/无响应"。
+    DWORD now = GetTickCount();
+    if (g_lastPipeFailTick != 0 && (now - g_lastPipeFailTick) < kPipeRetryCooldownMs) {
+        LeaveCriticalSection(&g_cs);
+        return false;
+    }
+
+    for (int i = 0; i < 5; i++) {
         g_hPipe = CreateFileW(PIPE_NAME, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (g_hPipe != INVALID_HANDLE_VALUE) break;
         DWORD err = GetLastError();
         if (err != ERROR_PIPE_BUSY && err != ERROR_FILE_NOT_FOUND) break;
-        WaitNamedPipeW(PIPE_NAME, 200);
+        WaitNamedPipeW(PIPE_NAME, 100);
     }
 
     bool ok = g_hPipe != INVALID_HANDLE_VALUE;
+    g_lastPipeFailTick = ok ? 0 : now;
     LeaveCriticalSection(&g_cs);
     return ok;
 }
 
-static void Send(const IconMsg& m) {
-    if (!EnsurePipe()) return;
+// [修改] 返回值：调用方需要知道消息是否真的送达 Controller，
+// 只有真正送达时才能安全地把系统托盘里的原始图标删掉。
+static bool Send(const IconMsg& m) {
+    if (!EnsurePipe()) return false;
     EnterCriticalSection(&g_cs);
 
     DWORD w = 0;
@@ -320,9 +321,11 @@ static void Send(const IconMsg& m) {
     if (!ok || w != sizeof(m)) {
         CloseHandle(g_hPipe);
         g_hPipe = INVALID_HANDLE_VALUE;
+        ok = FALSE;
     }
 
     LeaveCriticalSection(&g_cs);
+    return ok != FALSE;
 }
 
 static void FillW(IconMsg& m, DWORD a, const NOTIFYICONDATAW* n) {
@@ -507,8 +510,6 @@ static void UnloadThreadImpl() {
         g_hMonitorThread = nullptr;
     }
 
-    for (int i = 0; i < 100 && g_pendingRetryThreads.load() > 0; ++i) Sleep(50);
-
     if (g_hooksReady.load()) {
         MH_DisableHook(MH_ALL_HOOKS);
         for (int i = 0; i < 40 && g_inFlightHooks.load() > 0; ++i) Sleep(25);
@@ -529,6 +530,7 @@ static void UnloadThreadImpl() {
     if (g_hStopEvent) { CloseHandle(g_hStopEvent); g_hStopEvent = nullptr; }
     if (g_hRestoreAllEvent) { CloseHandle(g_hRestoreAllEvent); g_hRestoreAllEvent = nullptr; }
     if (g_hFilterChangedEvent) { CloseHandle(g_hFilterChangedEvent); g_hFilterChangedEvent = nullptr; }
+    if (g_hTrayRebuildEvent) { CloseHandle(g_hTrayRebuildEvent); g_hTrayRebuildEvent = nullptr; }
 
     Log(L"资源清理完毕，即将卸载 DLL 本体。");
 }
@@ -562,9 +564,10 @@ static void MonitorThreadImpl() {
     waits.push_back(g_hStopEvent);
     waits.push_back(hRelease);
 
-    int idxRestoreEvt = -1, idxFilterEvt = -1, idxDir = -1;
+    int idxRestoreEvt = -1, idxFilterEvt = -1, idxTrayRebuildEvt = -1, idxDir = -1;
     if (g_hRestoreAllEvent) { idxRestoreEvt = (int)waits.size(); waits.push_back(g_hRestoreAllEvent); }
     if (g_hFilterChangedEvent) { idxFilterEvt = (int)waits.size(); waits.push_back(g_hFilterChangedEvent); }
+    if (g_hTrayRebuildEvent) { idxTrayRebuildEvt = (int)waits.size(); waits.push_back(g_hTrayRebuildEvent); }
     if (hDir != INVALID_HANDLE_VALUE) { idxDir = (int)waits.size(); waits.push_back(hDir); }
 
     FILETIME lastFilter{};
@@ -581,14 +584,11 @@ static void MonitorThreadImpl() {
             if (CompareFileTime(&lastFilter, &currentFilter) != 0) {
                 lastFilter = currentFilter;
                 bool inFilter = IsExeInFilter(filterContent, g_exePath);
-                if (inFilter) {
-                    if (!g_shouldIntercept.load()) {
-                        g_shouldIntercept.store(true);
-                    }
-                    // [修改] 解除接管限制，无论原本是否被接管，文件有变化时强制下发图标重建广播
-                    ScheduleRefreshRetries();
+                bool wasIntercepting = g_shouldIntercept.exchange(inFilter);
+                if (inFilter && !wasIntercepting) {
+                    ForceRefreshTrayIcons();
                 }
-                else if (!inFilter && g_shouldIntercept.load()) {
+                else if (!inFilter && wasIntercepting) {
                     RestoreAll(false);
                 }
             }
@@ -622,6 +622,11 @@ static void MonitorThreadImpl() {
             Sleep(20);
             checkFilterFile();
         }
+        else if (idxTrayRebuildEvt >= 0 && (int)idx == idxTrayRebuildEvt) {
+            if (g_shouldIntercept.load() && !g_unloading.load()) {
+                ForceRefreshTrayIcons();
+            }
+        }
         else if (idxDir >= 0 && (int)idx == idxDir) {
             Sleep(50);
             checkRestoreFile();
@@ -652,13 +657,44 @@ static BOOL DetourWImpl(DWORD a, PNOTIFYICONDATAW n, BOOL* pOutHandled) {
         IconMsg m{};
         FillW(m, a, n);
 
-        SaveW(a, n);
-        Send(m);
+        bool sent = Send(m);
 
-        if (a == NIM_ADD || a == NIM_MODIFY) {
-            if (Real_Shell_NotifyIconW) {
-                Real_Shell_NotifyIconW(NIM_DELETE, n);
-            }
+        // [关键修复] 只有确认消息真的送达 Controller，才允许把 NIM_ADD
+        // 对应的真实图标从系统托盘删掉。如果 Controller 暂时联系不上
+        // （还没启动 / 正在重启 / 崩溃 / 管道异常），绝不能把图标吞掉——
+        // 那样图标会彻底消失：既没进采集器弹窗，系统托盘里也被删了，
+        // 用户什么都看不到。这里直接放行，让真实 Shell_NotifyIconW
+        // 正常处理，图标照旧显示在系统托盘里，等 Controller 恢复后，
+        // 下一次该程序更新图标（或任务栏重建触发的重新 NIM_ADD）
+        // 会被正常接管。
+        if (!sent) {
+            // Controller 当前不可用时，任何消息都不要进入“接管状态”：
+            // 不写本地状态，也绝不删除系统托盘里的真实图标，直接放行原调用。
+            return FALSE;
+        }
+
+        // [新增，修复"TranslucentTB 类重复图标"问题]
+        // 根因：一些启动很快的程序，进程刚起来几毫秒内就调用了
+        // NIM_ADD——这时 Controller 的扫描线程可能还没来得及发现这个
+        // 新进程并完成注入，于是这第一次 NIM_ADD 是"裸"的，真实图标
+        // 已经出现在系统托盘里了。等 DLL 注入完成、Hook 生效后，
+        // 程序后续的 NIM_MODIFY（比如刷新提示文字/图标状态）才第一次
+        // 被我们截获——但原来的代码只在 NIM_ADD 时才会去删真实图标，
+        // MODIFY 不会，于是这份"漏网"的真实图标会一直留在系统托盘里，
+        // 采集器这边却又正常收到了后续更新、显示出一份"收编"的图标，
+        // 看起来就像同一个程序出现了两份。
+        // 修复思路：不再只看这次调用是不是 NIM_ADD，而是看这是不是
+        // Hook 生效以来第一次见到这个图标（本地状态表里还没有它）——
+        // 只要是第一次见到，不管消息类型是什么，都顺手把真实图标删一次，
+        // 把之前"漏网"的那份也收回来。
+        std::wstring key = StateKey(*n);
+        bool firstSighting = !HasKnownState(key);
+
+        SaveW(a, n);
+
+        bool shouldRemoveReal = Real_Shell_NotifyIconW && a != NIM_DELETE && (a == NIM_ADD || firstSighting);
+        if (shouldRemoveReal) {
+            Real_Shell_NotifyIconW(NIM_DELETE, n);
         }
         *pOutHandled = TRUE;
         return TRUE;
@@ -688,6 +724,15 @@ static BOOL DetourAImpl(DWORD a, PNOTIFYICONDATAA n, BOOL* pOutHandled) {
         IconMsg m{};
         FillA(m, a, n);
 
+        bool sent = Send(m);
+
+        // 同 DetourWImpl 的修复：Controller 联系不上时绝不吞掉真实图标。
+        if (!sent) {
+            // Controller 当前不可用时，任何消息都不要进入“接管状态”：
+            // 不写本地状态，也绝不删除系统托盘里的真实图标，直接放行原调用。
+            return FALSE;
+        }
+
         NOTIFYICONDATAW w{};
         w.cbSize = sizeof(w);
         w.hWnd = n->hWnd;
@@ -699,13 +744,18 @@ static BOOL DetourAImpl(DWORD a, PNOTIFYICONDATAA n, BOOL* pOutHandled) {
         w.guidItem = n->guidItem;
         if (n->uFlags & NIF_TIP) MultiByteToWideChar(CP_ACP, 0, n->szTip, -1, w.szTip, 128);
 
-        SaveW(a, &w);
-        Send(m);
+        // 同 DetourWImpl 的修复：不管这次是不是 NIM_ADD，只要是 Hook
+        // 生效以来第一次见到这个图标，就顺手把真实图标删一次，
+        // 收回那些"进程启动太快、注入完成前就已经裸调用了 NIM_ADD"
+        // 而漏网在系统托盘里的图标。
+        std::wstring key = StateKey(w);
+        bool firstSighting = !HasKnownState(key);
 
-        if (a == NIM_ADD || a == NIM_MODIFY) {
-            if (Real_Shell_NotifyIconA) {
-                Real_Shell_NotifyIconA(NIM_DELETE, n);
-            }
+        SaveW(a, &w);
+
+        bool shouldRemoveReal = Real_Shell_NotifyIconA && a != NIM_DELETE && (a == NIM_ADD || firstSighting);
+        if (shouldRemoveReal) {
+            Real_Shell_NotifyIconA(NIM_DELETE, n);
         }
         *pOutHandled = TRUE;
         return TRUE;
@@ -767,6 +817,11 @@ static DWORD InitImpl() {
     ReadFileText(filterContent, nullptr);
     g_shouldIntercept.store(IsExeInFilter(filterContent, g_exePath));
 
+    wchar_t rebuildName[128]{};
+    swprintf_s(rebuildName, L"TrayCollector_Rebuild_%u", GetCurrentProcessId());
+    g_hTrayRebuildEvent = CreateEventW(nullptr, FALSE, FALSE, rebuildName);
+    if (!g_hTrayRebuildEvent) { Log(L"创建重建事件失败"); return 1; }
+
     if (MH_Initialize() != MH_OK) { Log(L"MH_Initialize失败"); return 1; }
 
     for (int i = 0; i < 100 && !g_stop; i++) {
@@ -778,9 +833,7 @@ static DWORD InitImpl() {
 
     g_hMonitorThread = CreateThread(nullptr, 0, MonitorThread, nullptr, 0, nullptr);
 
-    if (g_shouldIntercept.load()) {
-        ScheduleRefreshRetries();
-    }
+    InitialRefresh();
 
     return 0;
 }
